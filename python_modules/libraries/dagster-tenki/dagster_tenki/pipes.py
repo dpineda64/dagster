@@ -166,8 +166,6 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
         *,
         context: OpExecutionContext | AssetExecutionContext,
         command: str | Sequence[str],
-        image: str | None = None,
-        snapshot_id: str | None = None,
         extras: PipesExtras | None = None,
         env: Mapping[str, str] | None = None,
         sandbox_kwargs: Mapping[str, Any] | None = None,
@@ -179,9 +177,6 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
             context (Union[OpExecutionContext, AssetExecutionContext]): The context from the
                 executing op or asset.
             command (Union[str, Sequence[str]]): The command to run in the sandbox.
-            image (Optional[str]): The image to boot the sandbox from. The image only needs
-                ``dagster-pipes`` available to it.
-            snapshot_id (Optional[str]): The snapshot to boot the sandbox from.
             extras (Optional[PipesExtras]): Extra values to pass along as part of the ext
                 protocol.
             env (Optional[Mapping[str, str]]): A mapping of environment variable names to
@@ -205,12 +200,7 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
                 **(env or {}),
                 **pipes_session.get_bootstrap_env_vars(),
             }
-            sb = self._create_sandbox(
-                image=image,
-                snapshot_id=snapshot_id,
-                env=sandbox_env,
-                sandbox_kwargs=sandbox_kwargs,
-            )
+            sb = self._create_sandbox(env=sandbox_env, sandbox_kwargs=sandbox_kwargs)
             session_id = sb.id
             try:
                 proc = sb.start(*_as_argv(command))
@@ -242,8 +232,6 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
     def _create_sandbox(
         self,
         *,
-        image: str | None,
-        snapshot_id: str | None,
         env: Mapping[str, str],
         sandbox_kwargs: Mapping[str, Any] | None,
     ):
@@ -253,10 +241,6 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
             "env": {**kwargs_env, **env},
             **kwargs,
         }
-        if image is not None:
-            create_kwargs["image"] = image
-        if snapshot_id is not None:
-            create_kwargs["snapshot_id"] = snapshot_id
 
         if self._client is not None:
             return self._client.create(**create_kwargs)

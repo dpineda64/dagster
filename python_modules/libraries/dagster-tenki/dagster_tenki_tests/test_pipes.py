@@ -86,7 +86,8 @@ class _FakeClient:
     def __init__(self):
         self.last_sandbox = None
 
-    def create(self, *, env, image=None, snapshot_id=None, **kwargs):
+    def create(self, *, env, **kwargs):
+        self.create_kwargs = kwargs
         self.last_sandbox = _FakeSandbox(env)
         return self.last_sandbox
 
@@ -98,8 +99,8 @@ def test_pipes_tenki_client_materialization():
     def my_asset(context: AssetExecutionContext, tenki_pipes: PipesTenkiClient):
         return tenki_pipes.run(
             context=context,
-            image="test-workspace/base",
             command=[sys.executable, "-c", _MATERIALIZE_SCRIPT],
+            sandbox_kwargs={"cpu_cores": 2},
         ).get_materialize_result()
 
     result = materialize(
@@ -117,7 +118,8 @@ def test_pipes_tenki_client_materialization():
     assert metadata["foo"].value == "bar"
     # completion metadata attached by the client surfaces on every materialization
     assert metadata["tenki_session_id"].value == "sandbox-abc123"
-    # image was forwarded to Sandbox.create
+    # sandbox_kwargs are forwarded to Sandbox.create
+    assert fake_client.create_kwargs["cpu_cores"] == 2
     assert fake_client.last_sandbox.closed is True
 
 
