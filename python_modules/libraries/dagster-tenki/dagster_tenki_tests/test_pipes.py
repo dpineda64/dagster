@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 
 import pytest
 from dagster import AssetExecutionContext, asset, materialize
@@ -63,9 +64,27 @@ class _FakeProcess:
         return _FakeResult(self._popen.wait(timeout=timeout))
 
 
+class _FakeFS:
+    """Stands in for ``sb.fs``; writes to the local filesystem so the injected
+    ``dagster_pipes`` source is genuinely importable by the local subprocess.
+    """
+
+    def __init__(self):
+        self.writes = {}
+
+    def mkdir(self, path, *, recursive=True, mode=0o755):
+        os.makedirs(path, exist_ok=recursive)
+
+    def write_bytes(self, path, data):
+        self.writes[path] = data
+        with open(path, "wb") as f:
+            f.write(data)
+
+
 class _FakeSandbox:
     def __init__(self, env):
         self._env = env
+        self.fs = _FakeFS()
         self.closed = False
 
     @property
@@ -95,32 +114,61 @@ class _FakeClient:
 def test_pipes_tenki_client_materialization():
     fake_client = _FakeClient()
 
+    with tempfile.TemporaryDirectory() as source_dir:
+
+        @asset
+        def my_asset(context: AssetExecutionContext, tenki_pipes: PipesTenkiClient):
+            return tenki_pipes.run(
+                context=context,
+                command=[sys.executable, "-c", _MATERIALIZE_SCRIPT],
+                sandbox_kwargs={"cpu_cores": 2},
+            ).get_materialize_result()
+
+        result = materialize(
+            [my_asset],
+            resources={
+                "tenki_pipes": PipesTenkiClient(client=fake_client, pipes_source_dir=source_dir)
+            },
+            raise_on_error=False,
+        )
+
+        assert result.success
+        mats = result.asset_materializations_for_node(my_asset.op.name)
+        assert len(mats) == 1
+        metadata = mats[0].metadata
+        # metadata reported by the external process surfaces on the materialization
+        assert metadata["row_count"].value == 100
+        assert metadata["foo"].value == "bar"
+        # completion metadata attached by the client surfaces on every materialization
+        assert metadata["tenki_session_id"].value == "sandbox-abc123"
+        # sandbox_kwargs are forwarded to Sandbox.create
+        assert fake_client.create_kwargs["cpu_cores"] == 2
+        assert fake_client.last_sandbox.closed is True
+        # dagster_pipes source was injected into the sandbox and put on PYTHONPATH
+        assert os.path.exists(os.path.join(source_dir, "dagster_pipes", "__init__.py"))
+        assert fake_client.last_sandbox._env["PYTHONPATH"].startswith(source_dir)  # noqa: SLF001
+
+
+def test_pipes_tenki_client_inject_disabled():
+    fake_client = _FakeClient()
+
     @asset
     def my_asset(context: AssetExecutionContext, tenki_pipes: PipesTenkiClient):
         return tenki_pipes.run(
             context=context,
             command=[sys.executable, "-c", _MATERIALIZE_SCRIPT],
-            sandbox_kwargs={"cpu_cores": 2},
         ).get_materialize_result()
 
     result = materialize(
         [my_asset],
-        resources={"tenki_pipes": PipesTenkiClient(client=fake_client)},
+        resources={"tenki_pipes": PipesTenkiClient(client=fake_client, inject_pipes_source=False)},
         raise_on_error=False,
     )
 
     assert result.success
-    mats = result.asset_materializations_for_node(my_asset.op.name)
-    assert len(mats) == 1
-    metadata = mats[0].metadata
-    # metadata reported by the external process surfaces on the materialization
-    assert metadata["row_count"].value == 100
-    assert metadata["foo"].value == "bar"
-    # completion metadata attached by the client surfaces on every materialization
-    assert metadata["tenki_session_id"].value == "sandbox-abc123"
-    # sandbox_kwargs are forwarded to Sandbox.create
-    assert fake_client.create_kwargs["cpu_cores"] == 2
-    assert fake_client.last_sandbox.closed is True
+    # nothing was written to the sandbox and PYTHONPATH was left untouched
+    assert fake_client.last_sandbox.fs.writes == {}
+    assert "PYTHONPATH" not in fake_client.last_sandbox._env  # noqa: SLF001
 
 
 def test_pipes_tenki_client_nonzero_exit_raises():

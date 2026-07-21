@@ -1,3 +1,4 @@
+import importlib.resources
 import shlex
 import sys
 import threading
@@ -107,6 +108,17 @@ def _as_argv(command: str | Sequence[str]) -> list[str]:
     return [str(part) for part in command]
 
 
+# Directory in the sandbox that the orchestrator's ``dagster_pipes`` source is written to
+# (and prepended to ``PYTHONPATH``) when ``inject_pipes_source`` is enabled.
+DEFAULT_PIPES_SOURCE_DIR = "/tmp/dagster_pipes_src"
+
+
+def _read_dagster_pipes_source() -> bytes:
+    # ``dagster_pipes`` is a single-file, dependency-free module by design, so we can vendor
+    # the orchestrator's exact copy into the sandbox rather than relying on an install.
+    return importlib.resources.files("dagster_pipes").joinpath("__init__.py").read_bytes()
+
+
 class PipesTenkiClient(PipesClient, TreatAsResourceParam):
     """A pipes client that runs external processes inside a Tenki sandbox (an isolated
     remote cloud VM).
@@ -130,6 +142,14 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
             :py:class:`PipesTenkiMessageReader`.
         forward_termination (bool): Whether to terminate the Tenki sandbox if the
             orchestration process is interrupted or canceled. Defaults to True.
+        inject_pipes_source (bool): Whether to write the orchestrator's ``dagster_pipes``
+            source into the sandbox and prepend it to ``PYTHONPATH`` before running the
+            command, so the command can ``import dagster_pipes`` without it being installed
+            in the sandbox. Set to False if your image/snapshot already provides it.
+            Defaults to True.
+        pipes_source_dir (str): The directory in the sandbox that ``dagster_pipes`` is
+            written to when ``inject_pipes_source`` is enabled. Defaults to
+            ``/tmp/dagster_pipes_src``.
     """
 
     def __init__(
@@ -139,6 +159,8 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
         context_injector: PipesContextInjector | None = None,
         message_reader: PipesMessageReader | None = None,
         forward_termination: bool = True,
+        inject_pipes_source: bool = True,
+        pipes_source_dir: str = DEFAULT_PIPES_SOURCE_DIR,
     ):
         self._client = client
         self.env = check.opt_mapping_param(env, "env", key_type=str, value_type=str)
@@ -155,6 +177,8 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
             or PipesTenkiMessageReader()
         )
         self.forward_termination = check.bool_param(forward_termination, "forward_termination")
+        self.inject_pipes_source = check.bool_param(inject_pipes_source, "inject_pipes_source")
+        self.pipes_source_dir = check.str_param(pipes_source_dir, "pipes_source_dir")
 
     @classmethod
     def _is_dagster_maintained(cls) -> bool:
@@ -200,9 +224,19 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
                 **(env or {}),
                 **pipes_session.get_bootstrap_env_vars(),
             }
+            if self.inject_pipes_source:
+                # Point PYTHONPATH at the (soon-to-be-written) source before the sandbox is
+                # created, since session env is what the launched command inherits.
+                existing = sandbox_env.get("PYTHONPATH")
+                sandbox_env["PYTHONPATH"] = (
+                    self.pipes_source_dir if not existing else f"{self.pipes_source_dir}:{existing}"
+                )
             sb = self._create_sandbox(env=sandbox_env, sandbox_kwargs=sandbox_kwargs)
             session_id = sb.id
             try:
+                if self.inject_pipes_source:
+                    self._inject_pipes_source(sb)
+
                 proc = sb.start(*_as_argv(command))
                 # We provide no stdin; close it so a command that reads stdin does not hang.
                 proc.close_stdin()
@@ -228,6 +262,13 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
         return PipesClientCompletedInvocation(
             pipes_session, metadata={"tenki_session_id": session_id}
         )
+
+    def _inject_pipes_source(self, sb) -> None:
+        # Vendor the orchestrator's ``dagster_pipes`` into the sandbox as an importable
+        # package under ``pipes_source_dir`` (which is on PYTHONPATH).
+        package_dir = f"{self.pipes_source_dir}/dagster_pipes"
+        sb.fs.mkdir(package_dir, recursive=True)
+        sb.fs.write_bytes(f"{package_dir}/__init__.py", _read_dagster_pipes_source())
 
     def _create_sandbox(
         self,
