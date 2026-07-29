@@ -1,4 +1,6 @@
+import functools
 import importlib.resources
+import logging
 import shlex
 import sys
 import threading
@@ -29,10 +31,11 @@ from dagster._core.pipes.utils import (
 from dagster_pipes import PipesDefaultMessageWriter, PipesExtras, PipesParams
 
 if TYPE_CHECKING:
-    from tenki_sandbox import Client
+    from tenki_sandbox import Client, Sandbox
     from tenki_sandbox.process import Process
 
 
+@public
 class PipesTenkiMessageReader(PipesMessageReader):
     """Message reader that extracts Dagster Pipes messages from the stdout stream of a
     command running inside a Tenki sandbox.
@@ -71,26 +74,29 @@ class PipesTenkiMessageReader(PipesMessageReader):
         # ``proc.stdout`` yields raw byte chunks that are not guaranteed to align on line
         # boundaries, so we buffer and split on newlines before handing complete lines to
         # the message extractor.
-        buffer = ""
-        for chunk in proc.stdout:
-            buffer += _to_text(chunk)
-            lines = buffer.split("\n")
-            buffer = lines.pop()
-            for line in lines:
-                extract_message_or_forward_to_stdout(handler, line)
-        if buffer:
-            extract_message_or_forward_to_stdout(handler, buffer)
-
-        stderr_thread.join()
+        try:
+            buffer = ""
+            for chunk in proc.stdout:
+                buffer += _to_text(chunk)
+                lines = buffer.split("\n")
+                buffer = lines.pop()
+                for line in lines:
+                    extract_message_or_forward_to_stdout(handler, line)
+            if buffer:
+                extract_message_or_forward_to_stdout(handler, buffer)
+        finally:
+            stderr_thread.join()
 
     def _forward_stderr(self, proc: "Process") -> None:
         try:
             for chunk in proc.stderr:
-                sys.stdout.write(_to_text(chunk))
+                sys.stderr.write(_to_text(chunk))
         except Exception:
             # stderr forwarding is best-effort; failures here should not mask the primary
             # error surfaced from stdout consumption or ``proc.wait()``.
-            pass
+            logging.getLogger("dagster_tenki").debug(
+                "stderr forwarding thread failed", exc_info=True
+            )
 
     def no_messages_debug_text(self) -> str:
         return "Attempted to read messages by extracting them from the Tenki sandbox stdout stream."
@@ -113,12 +119,14 @@ def _as_argv(command: str | Sequence[str]) -> list[str]:
 DEFAULT_PIPES_SOURCE_DIR = "/tmp/dagster_pipes_src"
 
 
+@functools.cache
 def _read_dagster_pipes_source() -> bytes:
     # ``dagster_pipes`` is a single-file, dependency-free module by design, so we can vendor
     # the orchestrator's exact copy into the sandbox rather than relying on an install.
     return importlib.resources.files("dagster_pipes").joinpath("__init__.py").read_bytes()
 
 
+@public
 class PipesTenkiClient(PipesClient, TreatAsResourceParam):
     """A pipes client that runs external processes inside a Tenki sandbox (an isolated
     remote cloud VM).
@@ -207,7 +215,8 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
                 values to set in the sandbox, on top of those configured on the resource.
             sandbox_kwargs (Optional[Mapping[str, Any]]): Additional keyword arguments to
                 forward to ``Sandbox.create`` (e.g. ``cpu_cores``, ``memory_mb``,
-                ``allow_outbound``).
+                ``allow_outbound``). Note: an ``env`` key here is merged *under* the
+                Pipes env vars and the ``env`` parameter, so it cannot override them.
 
         Returns:
             PipesClientCompletedInvocation: Wrapper containing results reported by the
@@ -263,7 +272,7 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
             pipes_session, metadata={"tenki_session_id": session_id}
         )
 
-    def _inject_pipes_source(self, sb) -> None:
+    def _inject_pipes_source(self, sb: "Sandbox") -> None:
         # Vendor the orchestrator's ``dagster_pipes`` into the sandbox as an importable
         # package under ``pipes_source_dir`` (which is on PYTHONPATH).
         package_dir = f"{self.pipes_source_dir}/dagster_pipes"
@@ -275,7 +284,7 @@ class PipesTenkiClient(PipesClient, TreatAsResourceParam):
         *,
         env: Mapping[str, str],
         sandbox_kwargs: Mapping[str, Any] | None,
-    ):
+    ) -> "Sandbox":
         kwargs = dict(sandbox_kwargs or {})
         kwargs_env = dict(kwargs.pop("env", {}) or {})
         create_kwargs: dict[str, Any] = {

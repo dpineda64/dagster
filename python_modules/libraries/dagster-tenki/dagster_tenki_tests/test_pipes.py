@@ -5,6 +5,9 @@ import tempfile
 
 import pytest
 from dagster import AssetExecutionContext, asset, materialize
+from dagster._core.errors import DagsterExecutionInterruptedError, DagsterPipesExecutionError
+from dagster._core.pipes.client import PipesMessageReader
+from dagster_pipes import PipesDefaultMessageWriter, PipesParams
 from dagster_tenki.pipes import PipesTenkiClient
 
 # External scripts run inside the (fake) sandbox. They depend only on `dagster-pipes`,
@@ -50,6 +53,7 @@ class _FakeProcess:
         self._popen = subprocess.Popen(
             list(argv),
             env={**os.environ, **env},
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -58,7 +62,8 @@ class _FakeProcess:
         self.stderr = self._popen.stderr
 
     def close_stdin(self) -> None:
-        pass
+        if self._popen.stdin:
+            self._popen.stdin.close()
 
     def wait(self, timeout=None) -> _FakeResult:
         return _FakeResult(self._popen.wait(timeout=timeout))
@@ -152,23 +157,31 @@ def test_pipes_tenki_client_materialization():
 def test_pipes_tenki_client_inject_disabled():
     fake_client = _FakeClient()
 
-    @asset
-    def my_asset(context: AssetExecutionContext, tenki_pipes: PipesTenkiClient):
-        return tenki_pipes.run(
-            context=context,
-            command=[sys.executable, "-c", _MATERIALIZE_SCRIPT],
-        ).get_materialize_result()
+    with tempfile.TemporaryDirectory() as source_dir:
 
-    result = materialize(
-        [my_asset],
-        resources={"tenki_pipes": PipesTenkiClient(client=fake_client, inject_pipes_source=False)},
-        raise_on_error=False,
-    )
+        @asset
+        def my_asset(context: AssetExecutionContext, tenki_pipes: PipesTenkiClient):
+            return tenki_pipes.run(
+                context=context,
+                command=[sys.executable, "-c", _MATERIALIZE_SCRIPT],
+            ).get_materialize_result()
 
-    assert result.success
-    # nothing was written to the sandbox and PYTHONPATH was left untouched
-    assert fake_client.last_sandbox.fs.writes == {}
-    assert "PYTHONPATH" not in fake_client.last_sandbox._env  # noqa: SLF001
+        result = materialize(
+            [my_asset],
+            resources={
+                "tenki_pipes": PipesTenkiClient(
+                    client=fake_client,
+                    inject_pipes_source=False,
+                    pipes_source_dir=source_dir,
+                )
+            },
+            raise_on_error=False,
+        )
+
+        assert result.success
+        # nothing was written to the sandbox and PYTHONPATH was left untouched
+        assert fake_client.last_sandbox.fs.writes == {}
+        assert "PYTHONPATH" not in fake_client.last_sandbox._env  # noqa: SLF001
 
 
 def test_pipes_tenki_client_nonzero_exit_raises():
@@ -202,9 +215,144 @@ def test_pipes_tenki_client_raises_on_error():
             command=[sys.executable, "-c", _FAILURE_SCRIPT],
         ).get_materialize_result()
 
-    with pytest.raises(Exception, match="Tenki sandbox command failed"):
+    with pytest.raises(DagsterPipesExecutionError, match="Tenki sandbox command failed"):
         materialize(
             [failing_asset],
             resources={"tenki_pipes": PipesTenkiClient(client=fake_client)},
             raise_on_error=True,
         )
+
+
+_HANG_SCRIPT = """
+import time
+from dagster_pipes import open_dagster_pipes
+
+with open_dagster_pipes() as pipes:
+    time.sleep(60)
+"""
+
+
+class _InterruptingSandbox:
+    """A sandbox whose start() returns a process that immediately raises
+    DagsterExecutionInterruptedError when its stdout is consumed, simulating
+    an orchestrator cancellation.
+    """
+
+    def __init__(self, env):
+        self._env = env
+        self.fs = _FakeFS()
+        self.closed = False
+
+    @property
+    def id(self) -> str:
+        return "sandbox-interrupted"
+
+    def start(self, *argv):
+        return _InterruptingProcess()
+
+    def close_if_open(self) -> None:
+        self.closed = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _InterruptingProcess:
+    """A fake process whose stdout iteration raises DagsterExecutionInterruptedError."""
+
+    def __init__(self):
+        self.stdout = self._raise_on_iter()
+        self.stderr = iter([])
+
+    def close_stdin(self) -> None:
+        pass
+
+    def _raise_on_iter(self):
+        raise DagsterExecutionInterruptedError()
+        yield  # make this a generator
+
+    def wait(self, timeout=None) -> _FakeResult:
+        return _FakeResult(0)
+
+
+class _InterruptingClient:
+    def __init__(self):
+        self.last_sandbox = None
+
+    def create(self, *, env, **kwargs):
+        self.last_sandbox = _InterruptingSandbox(env)
+        return self.last_sandbox
+
+
+def test_pipes_tenki_client_forward_termination():
+    """When forward_termination=True (default), the sandbox is closed on interruption."""
+    fake_client = _InterruptingClient()
+
+    @asset
+    def my_asset(context: AssetExecutionContext, tenki_pipes: PipesTenkiClient):
+        return tenki_pipes.run(
+            context=context,
+            command=["python", "-c", _HANG_SCRIPT],
+        ).get_materialize_result()
+
+    result = materialize(
+        [my_asset],
+        resources={
+            "tenki_pipes": PipesTenkiClient(
+                client=fake_client, forward_termination=True, inject_pipes_source=False
+            )
+        },
+        raise_on_error=False,
+    )
+
+    assert not result.success
+    assert fake_client.last_sandbox.closed is True
+
+
+def test_pipes_tenki_client_custom_message_reader():
+    """When a non-PipesTenkiMessageReader is used, consume_sandbox_logs is skipped."""
+    fake_client = _FakeClient()
+
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+
+    from dagster._core.pipes.context import PipesMessageHandler
+
+    class _NoOpMessageReader(PipesMessageReader):
+        """A minimal PipesMessageReader that is NOT a PipesTenkiMessageReader."""
+
+        @contextmanager
+        def read_messages(self, handler: PipesMessageHandler) -> Iterator[PipesParams]:
+            yield {PipesDefaultMessageWriter.STDIO_KEY: PipesDefaultMessageWriter.STDOUT}
+
+        def no_messages_debug_text(self) -> str:
+            return "no-op"
+
+    _SIMPLE_SCRIPT = """
+import sys
+print("hello from custom reader test")
+"""
+
+    @asset
+    def my_asset(context: AssetExecutionContext, tenki_pipes: PipesTenkiClient):
+        return tenki_pipes.run(
+            context=context,
+            command=[sys.executable, "-c", _SIMPLE_SCRIPT],
+        ).get_materialize_result()
+
+    result = materialize(
+        [my_asset],
+        resources={
+            "tenki_pipes": PipesTenkiClient(
+                client=fake_client,
+                message_reader=_NoOpMessageReader(),
+                inject_pipes_source=False,
+            )
+        },
+        raise_on_error=False,
+    )
+
+    # The run completes successfully — the isinstance guard skips consume_sandbox_logs
+    # but the process still runs and the exit code is checked.
+    assert result.success
+    assert fake_client.last_sandbox.closed is True
